@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Food Security Quiz — WebXR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html,body{margin:0;height:100%;background:#0b1220;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto,Arial;}
+  #fallback{position:fixed;inset:0;display:grid;place-items:center;text-align:center;padding:24px;line-height:1.5}
+  a{color:#93c5fd}
+</style>
+</head>
+<body>
+<div id="fallback">
+  <div>
+    <h1>Food Security Quiz (WebXR)</h1>
+    <p>This experience supports VR on devices/browsers with WebXR (Meta Quest Browser recommended).</p>
+    <p>On desktop, you can still orbit the scene. In VR, use your controller ray and trigger to select answers.</p>
+  </div>
+</div>
+
+<script type="module">
+/* ===== Imports (three.js + helpers) ===================================== */
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { VRButton } from 'https://unpkg.com/three@0.158.0/examples/jsm/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'https://unpkg.com/three@0.158.0/examples/jsm/webxr/XRControllerModelFactory.js';
+
+/* ===== Quiz Data (edit freely) ========================================== */
+const QUESTIONS = [
+  {
+    text: "Which is NOT one of the widely used pillars of food security?",
+    choices: ["Availability", "Access", "Utilization", "Astrology"],
+    correct: 3,
+    why: "Common pillars are availability, access, utilization, and stability; 'astrology' is not one."
+  },
+  {
+    text: "Roughly what share of all food produced is lost or wasted worldwide?",
+    choices: ["About 10%", "About one-third", "About 60%", "Almost all"],
+    correct: 1,
+    why: "Most assessments estimate roughly one-third of food is lost or wasted."
+  },
+  {
+    text: "Which on-farm practice best helps smallholders improve resilience to climate shocks?",
+    choices: ["Monocropping", "Crop diversification", "Removing all shade trees", "Over-irrigation"],
+    correct: 1,
+    why: "Diversifying crops spreads risk, improves soil health, and buffers against weather variability."
+  }
+];
+
+/* ===== Three.js / WebXR setup =========================================== */
+let scene, camera, renderer, panel, interactive = [];
+let controller1, controller2;
+let hoverMap = new Map(); // controller -> hovered object
+const raycaster = new THREE.Raycaster();
+const tempMatrix = new THREE.Matrix4();
+
+THREE.ColorManagement.enabled = true;
+
+scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1220);
+
+// camera for non-VR fallback view
+camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 200);
+camera.position.set(0, 1.6, 2.4);
+scene.add(camera);
+
+// lights & ground
+const hemi = new THREE.HemisphereLight(0xbfd8ff, 0x223344, 0.7);
+const dir  = new THREE.DirectionalLight(0xffffff, 0.7);
+dir.position.set(1,2,1);
+scene.add(hemi, dir);
+const grid = new THREE.GridHelper(8, 16, 0x374151, 0x1f2937);
+grid.position.y = -1.2;
+scene.add(grid);
+
+// renderer
+renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+// place content on session start in front of the user
+renderer.xr.addEventListener('sessionstart', () => {
+  placePanelInFront();
+  document.getElementById('fallback')?.remove();
+});
+
+/* ===== Controller setup (ray + models) ================================== */
+function setupController(index){
+  const ctrl = renderer.xr.getController(index);
+  ctrl.addEventListener('selectstart', onSelectStart);
+  ctrl.addEventListener('selectend',   onSelectEnd);
+  ctrl.addEventListener('connected', (e)=>{
+    ctrl.add(buildRay());
+  });
+  ctrl.addEventListener('disconnected', ()=>{
+    while (ctrl.children.length) ctrl.remove(ctrl.children[0]);
+  });
+  scene.add(ctrl);
+
+  // controller model (grip)
+  const grip = renderer.xr.getControllerGrip(index);
+  const factory = new XRControllerModelFactory();
+  grip.add(factory.createControllerModel(grip));
+  scene.add(grip);
+
+  return ctrl;
+}
+function buildRay(){
+  const geom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1)
+  ]);
+  const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ transparent:true, opacity:0.8 }));
+  line.name = 'ray';
+  line.scale.z = 5;
+  return line;
+}
+controller1 = setupController(0);
+controller2 = setupController(1);
+
+/* ===== 3D UI: Panel + widgets ========================================== */
+const ui = {
+  state: 'start', // 'start' | 'quiz' | 'result'
+  qIndex: -1,
+  score: 0,
+  locked: false,
+  meshes: {}
+};
+
+panel = new THREE.Group();
+scene.add(panel);
+
+// Panel background
+const PANEL_W = 1.3, PANEL_H = 0.85;
+const bg = new THREE.Mesh(
+  new THREE.PlaneGeometry(PANEL_W, PANEL_H),
+  new THREE.MeshPhysicalMaterial({
+    color: 0x0f172a, roughness: 0.9, transmission: 0, clearcoat: 0.1,
+    metalness: 0, reflectivity: 0.1
+  })
+);
+bg.position.set(0, 1.5, -1.8); // initial; will be repositioned
+bg.receiveShadow = true;
+panel.add(bg);
+
+// panel frame
+const frame = new THREE.Mesh(
+  new THREE.PlaneGeometry(PANEL_W+0.02, PANEL_H+0.02),
+  new THREE.MeshBasicMaterial({ color: 0x1f2937, side: THREE.DoubleSide })
+);
+frame.position.copy(bg.position).add(new THREE.Vector3(0,0, -0.001));
+panel.add(frame);
+
+// Title
+const title = makeLabelMesh("Food Security Quiz", 1.1, 0.12, {size: 44, align:'center', weight:800, bg:null});
+title.position.set(bg.position.x, bg.position.y + PANEL_H/2 - 0.09, bg.position.z+0.001);
+panel.add(title);
+
+// Progress / mini score
+const progress = makeLabelMesh("Ready", 0.5, 0.06, {size: 28, align:'left', bg:null, color:'#93a3b8'});
+progress.position.set(bg.position.x - PANEL_W/2 + 0.30, bg.position.y + PANEL_H/2 - 0.16, bg.position.z+0.001);
+panel.add(progress);
+ui.meshes.progress = progress;
+
+// Question text area
+const qText = makeLabelMesh("Question", 1.1, 0.22, {size: 36, align:'left'});
+qText.position.set(bg.position.x, bg.position.y + 0.18, bg.position.z+0.001);
+panel.add(qText);
+ui.meshes.qText = qText;
+
+// Answer buttons (4)
+const answerButtons = [];
+const btnW = 0.56, btnH = 0.11;
+const positions = [
+  [-0.32,  0.05],
+  [ 0.32,  0.05],
+  [-0.32, -0.10],
+  [ 0.32, -0.10],
+];
+for (let i=0;i<4;i++){
+  const btn = makeButtonMesh(``, btnW, btnH);
+  btn.position.set(bg.position.x + positions[i][0], bg.position.y + positions[i][1], bg.position.z+0.002);
+  btn.userData.type = 'answer';
+  btn.userData.index = i;
+  panel.add(btn);
+  answerButtons.push(btn);
+}
+ui.meshes.answerButtons = answerButtons;
+
+// Feedback box
+const feedback = makeLabelMesh("", 1.1, 0.16, {size: 26, align:'left', bg:'#0b1f19', border:'#164e3f'});
+feedback.position.set(bg.position.x, bg.position.y - 0.28, bg.position.z+0.001);
+panel.add(feedback);
+ui.meshes.feedback = feedback;
+
+// Next / Restart / Start buttons
+const nextBtn = makeButtonMesh("Next ▶", 0.28, 0.10);
+nextBtn.position.set(bg.position.x + PANEL_W/2 - 0.19, bg.position.y - PANEL_H/2 + 0.10, bg.position.z+0.002);
+nextBtn.userData.type = 'next';
+panel.add(nextBtn);
+ui.meshes.next = nextBtn;
+
+const restartBtn = makeButtonMesh("Restart ↻", 0.36, 0.10);
+restartBtn.position.set(bg.position.x, bg.position.y - 0.02, bg.position.z+0.002);
+restartBtn.userData.type = 'restart';
+restartBtn.visible = false;
+panel.add(restartBtn);
+ui.meshes.restart = restartBtn;
+
+const startBtn = makeButtonMesh("Start ▶", 0.36, 0.10);
+startBtn.position.set(bg.position.x, bg.position.y - 0.02, bg.position.z+0.002);
+startBtn.userData.type = 'start';
+panel.add(startBtn);
+ui.meshes.start = startBtn;
+
+// initial visibility
+setQuizVisibility({start:true});
+
+/* ===== UI logic ========================================================= */
+function setQuizVisibility({start=false, quiz=false, result=false}={}){
+  ui.state = start ? 'start' : result ? 'result' : 'quiz';
+
+  // answers & qText
+  ui.meshes.qText.visible = quiz;
+  ui.meshes.answerButtons.forEach(b => b.visible = quiz);
+  ui.meshes.feedback.visible = quiz;
+
+  ui.meshes.next.visible    = quiz;
+  ui.meshes.restart.visible = result;
+  ui.meshes.start.visible   = start;
+
+  // progress text
+  if (start) setLabelText(ui.meshes.progress, "Ready");
+}
+
+function startQuiz(){
+  ui.qIndex = -1;
+  ui.score = 0;
+  ui.locked = false;
+  setQuizVisibility({quiz:true});
+  nextQuestion();
+}
+
+function nextQuestion(){
+  ui.qIndex++;
+  if (ui.qIndex >= QUESTIONS.length){
+    showResults();
+    return;
+  }
+  ui.locked = false;
+  const q = QUESTIONS[ui.qIndex];
+
+  setLabelText(ui.meshes.progress, `Question ${ui.qIndex+1}/${QUESTIONS.length} • Score ${ui.score}`);
+  setLabelText(ui.meshes.qText, q.text);
+
+  // fill buttons
+  ui.meshes.answerButtons.forEach((btn,i)=>{
+    btn.userData.state = 'neutral';
+    drawButton(btn, `${i+1}. ${q.choices[i]}`, 'neutral');
+    btn.visible = i < q.choices.length;
+  });
+
+  // clear feedback
+  setLabelBox(ui.meshes.feedback, "", '#0b1322', '#2a364a');
+  // next disabled look
+  drawButton(ui.meshes.next, "Next ▶", 'disabled');
+}
+
+function showResults(){
+  setQuizVisibility({result:true});
+  const pct = Math.round((ui.score / QUESTIONS.length) * 100);
+  setLabelText(ui.meshes.qText, `You scored ${ui.score} / ${QUESTIONS.length} (${pct}%)`);
+  const note =
+    pct === 100 ? "Perfect! You really know your stuff. 🌾" :
+    pct >= 67   ? "Great job! Strong understanding." :
+    pct >= 34   ? "Nice start—review the explanations and try again." :
+                  "Keep going! Each try grows knowledge.";
+  setLabelBox(ui.meshes.feedback, note, '#0b1322', '#2a364a');
+  ui.meshes.answerButtons.forEach(b=> b.visible=false);
+  ui.meshes.next.visible = false;
+  ui.meshes.restart.visible = true;
+  setLabelText(ui.meshes.progress, "Results");
+}
+
+/* ===== Interaction handling ============================================ */
+function onSelectStart(e){
+  const ctrl = e.target;
+  const hit = getIntersection(ctrl);
+  if (!hit) return;
+
+  const obj = hit.object;
+  const type = obj.userData.type;
+
+  if (ui.state === 'start' && type === 'start'){
+    startQuiz(); return;
+  }
+  if (ui.state === 'result' && type === 'restart'){
+    setQuizVisibility({start:true}); return;
+  }
+  if (ui.state === 'quiz'){
+    if (type === 'answer' && !ui.locked){
+      pickAnswer(obj.userData.index);
+      return;
+    }
+    if (type === 'next' && !ui.locked){
+      // ignore until answered
+      return;
+    }
+    if (type === 'next' && ui.locked){
+      nextQuestion();
+      return;
+    }
+  }
+}
+
+function onSelectEnd(){ /* not used, but kept for parity */ }
+
+function pickAnswer(index){
+  ui.locked = true;
+  const q = QUESTIONS[ui.qIndex];
+
+  const correct = q.correct;
+  // color all buttons
+  ui.meshes.answerButtons.forEach((btn,i)=>{
+    const state = (i === correct) ? 'correct' : (i === index ? 'wrong' : 'dim');
+    drawButton(btn, `${i+1}. ${q.choices[i]}`, state);
+  });
+
+  if (index === correct) {
+    ui.score++;
+    setLabelBox(ui.meshes.feedback, `✅ Correct! ${q.why}`, '#0b1f19', '#164e3f'); // green box
+  } else {
+    setLabelBox(ui.meshes.feedback, `❌ Not quite. ${q.why}`, '#1e0f0f', '#5b1c1c'); // red box
+  }
+  setLabelText(ui.meshes.progress, `Question ${ui.qIndex+1}/${QUESTIONS.length} • Score ${ui.score}`);
+  drawButton(ui.meshes.next, "Next ▶", 'primary');
+}
+
+/* ===== Raycasting (hover + feedback) =================================== */
+function getIntersection(controller){
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0,0,-1).applyMatrix4(tempMatrix);
+  const hits = raycaster.intersectObjects(interactive, false);
+  if (hits.length > 0) {
+    controller.getObjectByName('ray').scale.z = hits[0].distance;
+    return hits[0];
+  } else {
+    controller.getObjectByName('ray').scale.z = 5;
+    return null;
+  }
+}
+
+function handleHover(controller){
+  const hit = getIntersection(controller);
+  const prev = hoverMap.get(controller);
+  if (prev && (!hit || hit.object !== prev)) {
+    // un-hover previous (only if in neutral state)
+    if (prev.userData.type && prev.userData.type !== 'answer' || (prev.userData.type==='answer' && prev.userData.state==='neutral')){
+      // redraw neutral
+      if (prev.userData.type === 'next') drawButton(prev, "Next ▶", ui.locked ? 'primary':'disabled');
+      else if (prev.userData.type === 'restart') drawButton(prev, "Restart ↻", 'primary');
+      else if (prev.userData.type === 'start') drawButton(prev, "Start ▶", 'primary');
+      else if (prev.userData.type === 'answer') drawButton(prev, prev.userData.text, 'neutral');
+    }
+    hoverMap.delete(controller);
+  }
+  if (hit && hit.object.userData) {
+    const obj = hit.object;
+    // apply hover if applicable and not locked choice
+    if (obj.userData.type === 'answer' && !ui.locked && obj.userData.state==='neutral') {
+      drawButton(obj, obj.userData.text, 'hover');
+    } else if ((obj.userData.type === 'start') || (obj.userData.type === 'restart') || (obj.userData.type === 'next' && ui.locked)) {
+      drawButton(obj, obj.userData.text, 'hover');
+    }
+    hoverMap.set(controller, obj);
+  }
+}
+
+/* ===== Animation Loop ==================================================== */
+renderer.setAnimationLoop(()=>{
+  handleHover(controller1);
+  handleHover(controller2);
+  renderer.render(scene, camera);
+});
+
+/* ===== Responsive ======================================================== */
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ===== Helpers: panel placement & UI drawing ============================ */
+function placePanelInFront(distance=1.6){
+  const xrCam = renderer.xr.getCamera(camera);
+  const head = xrCam;
+  const dir = new THREE.Vector3(0,0,-1).applyQuaternion(head.quaternion).setY(0).normalize();
+  const pos = head.position.clone().addScaledVector(dir, distance);
+  pos.y = Math.max(1.2, head.position.y - 0.05); // gentle vertical offset
+
+  const lookAt = head.position.clone();
+  bg.position.copy(pos);
+  frame.position.copy(pos).add(new THREE.Vector3(0,0,-0.001));
+  title.position.set(pos.x, pos.y + PANEL_H/2 - 0.09, pos.z+0.001);
+  progress.position.set(pos.x - PANEL_W/2 + 0.30, pos.y + PANEL_H/2 - 0.16, pos.z+0.001);
+  qText.position.set(pos.x, pos.y + 0.18, pos.z+0.001);
+  ui.meshes.answerButtons.forEach((b,i)=>{
+    b.position.set(pos.x + positions[i][0], pos.y + positions[i][1], pos.z+0.002);
+  });
+  feedback.position.set(pos.x, pos.y - 0.28, pos.z+0.001);
+  nextBtn.position.set(pos.x + PANEL_W/2 - 0.19, pos.y - PANEL_H/2 + 0.10, pos.z+0.002);
+  restartBtn.position.set(pos.x, pos.y - 0.02, pos.z+0.002);
+  startBtn.position.set(pos.x, pos.y - 0.02, pos.z+0.002);
+
+  bg.lookAt(lookAt); frame.lookAt(lookAt); title.lookAt(lookAt); progress.lookAt(lookAt);
+  qText.lookAt(lookAt); feedback.lookAt(lookAt);
+  ui.meshes.answerButtons.forEach(b=> b.lookAt(lookAt));
+  nextBtn.lookAt(lookAt); restartBtn.lookAt(lookAt); startBtn.lookAt(lookAt);
+}
+
+/* === Canvas label / button drawing ===================================== */
+function makeLabelMesh(text, w, h, opts={}){
+  const tex = drawLabelTexture(text, opts, w, h);
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true })
+  );
+  mesh.userData.text = text;
+  return mesh;
+}
+function setLabelText(mesh, text, opts={}){
+  mesh.userData.text = text;
+  mesh.material.map = drawLabelTexture(text, opts, mesh.geometry.parameters.width, mesh.geometry.parameters.height);
+  mesh.material.needsUpdate = true;
+}
+
+function setLabelBox(mesh, text, bg='#0b1322', border='#2a364a'){
+  const opts = { bg, border, padding: 18, size: 26, align:'left' };
+  setLabelText(mesh, text, opts);
+}
+
+function makeButtonMesh(text, w, h){
+  const tex = drawButtonTexture(text, 'primary', w, h);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  mesh.userData.text = text;
+  mesh.userData.type = 'button';
+  mesh.userData.state = 'neutral';
+  interactive.push(mesh);
+  return mesh;
+}
+
+function drawButton(mesh, text, state='neutral'){
+  mesh.userData.text = text;
+  mesh.userData.state = state;
+  mesh.material.map = drawButtonTexture(text, state, mesh.geometry.parameters.width, mesh.geometry.parameters.height);
+  mesh.material.needsUpdate = true;
+}
+
+/* -- Textures ------------------------------------------------------------ */
+function drawLabelTexture(text, {
+  size=36, align='left', weight=700, color='#e5e7eb', bg='rgba(0,0,0,0)', border=null, padding=20, lineHeight=1.3
+}={}, wMeters=1.0, hMeters=0.2){
+  const scale = 900; // pixels per meter for crispness
+  const W = Math.max(64, Math.floor(wMeters * scale));
+  const H = Math.max(32, Math.floor(hMeters * scale));
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+
+  // background with optional border + subtle rounding
+  if (bg){
+    roundRect(ctx, 0, 0, W, H, Math.floor(18 * (W/1024)), bg);
+    if (border){
+      ctx.strokeStyle = border; ctx.lineWidth = Math.max(2, Math.floor(W/512));
+      roundRectStroke(ctx, 1, 1, W-2, H-2, Math.floor(18 * (W/1024)));
+    }
+  }
+
+  ctx.fillStyle = color;
+  ctx.font = `${weight} ${Math.floor(size * (W/1024))}px system-ui, Segoe UI, Roboto, Arial`;
+  ctx.textBaseline = 'top';
+
+  const maxTextWidth = W - padding*2;
+  const lines = wrapText(ctx, text, maxTextWidth, Math.floor(size * lineHeight * (W/1024)));
+  let x = padding, y = padding;
+  if (align === 'center'){
+    for (const line of lines){
+      const lw = ctx.measureText(line).width;
+      ctx.fillText(line, (W - lw)/2, y);
+      y += Math.floor(size * lineHeight * (W/1024));
+    }
+  } else {
+    for (const line of lines){
+      ctx.fillText(line, x, y);
+      y += Math.floor(size * lineHeight * (W/1024));
+    }
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+function drawButtonTexture(text, state='neutral', wMeters=0.5, hMeters=0.1){
+  const scale = 1000;
+  const W = Math.max(64, Math.floor(wMeters * scale));
+  const H = Math.max(32, Math.floor(hMeters * scale));
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+
+  // palette
+  const palettes = {
+    neutral : { bg:'#1f2937', border:'#2a364a', text:'#e5e7eb' },
+    hover   : { bg:'#243041', border:'#2f3d55', text:'#e5e7eb' },
+    primary : { bg:'#60a5fa', border:'#93c5fd', text:'#05111f' },
+    disabled: { bg:'#1a2336', border:'#2a364a', text:'#9aa9c2' },
+    correct : { bg:'#0f2a22', border:'#10b981', text:'#d1fae5' },
+    wrong   : { bg:'#2a1414', border:'#ef4444', text:'#fee2e2' },
+    dim     : { bg:'#161e2c', border:'#243041', text:'#9aa9c2' }
+  };
+  const p = palettes[state] || palettes.neutral;
+
+  // rounded box
+  roundRect(ctx, 0, 0, W, H, Math.floor(22 * (W/1000)), p.bg);
+  ctx.strokeStyle = p.border; ctx.lineWidth = Math.max(2, Math.floor(W/600));
+  roundRectStroke(ctx, 1, 1, W-2, H-2, Math.floor(22 * (W/1000)));
+
+  // text
+  ctx.fillStyle = p.text;
+  const base = Math.floor(38 * (W/1000));
+  ctx.font = `700 ${base}px system-ui, Segoe UI, Roboto, Arial`;
+  ctx.textBaseline = 'middle';
+  const tw = ctx.measureText(text).width;
+  ctx.fillText(text, (W - tw)/2, H/2);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+/* -- Canvas helpers ------------------------------------------------------ */
+function wrapText(ctx, text, maxWidth, lineHeight){
+  const words = String(text ?? '').split(/\s+/);
+  const lines = [];
+  let line = '';
+  for (const w of words){
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxWidth){
+      if (line) lines.push(line);
+      line = w;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function roundRect(ctx, x, y, w, h, r, fill='#000'){
+  if (r > Math.min(w,h)/2) r = Math.min(w,h)/2;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+function roundRectStroke(ctx, x, y, w, h, r){
+  if (r > Math.min(w,h)/2) r = Math.min(w,h)/2;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+  ctx.stroke();
+}
+
+/* ===== Populate initial content ======================================== */
+setLabelBox(ui.meshes.feedback, "Tap Start to begin.");
+drawButton(ui.meshes.start, "Start ▶", 'primary');
+drawButton(ui.meshes.restart, "Restart ↻", 'primary');
+drawButton(ui.meshes.next, "Next ▶", 'disabled');
+
+// Make buttons interactive
+interactive.push(...ui.meshes.answerButtons, ui.meshes.next, ui.meshes.restart, ui.meshes.start);
+
+/* ===== Dev: desktop orbit (optional, no external libs) ================== */
+let isMouseDown=false, prevX=0, prevY=0, theta=0, phi=10, radius=2.4;
+function updateOrbit(){
+  const t = THREE.MathUtils.degToRad(theta);
+  const p = THREE.MathUtils.degToRad(Math.max(-85, Math.min(85, phi)));
+  camera.position.set(
+    radius*Math.sin(t)*Math.cos(p),
+    1.6 + radius*Math.sin(p),
+    radius*Math.cos(t)*Math.cos(p)
+  );
+  camera.lookAt(0,1.5,0);
+}
+updateOrbit();
+window.addEventListener('mousedown', e=>{isMouseDown=true; prevX=e.clientX; prevY=e.clientY;});
+window.addEventListener('mousemove', e=>{
+  if(!isMouseDown) return;
+  theta -= (e.clientX - prevX) * 0.2;
+  phi   -= (e.clientY - prevY) * 0.2;
+  prevX = e.clientX; prevY = e.clientY;
+  updateOrbit();
+});
+window.addEventListener('mouseup', ()=>{isMouseDown=false;});
+window.addEventListener('wheel', e=>{ radius = Math.min(6, Math.max(1.2, radius + e.deltaY*0.001)); updateOrbit(); });
+
+</script>
+</body>
+</html>
